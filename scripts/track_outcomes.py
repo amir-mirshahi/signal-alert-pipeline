@@ -7,79 +7,75 @@ import yfinance as yf
 from app.database import SessionLocal
 from app.models import Signal
 
-def get_current_price(symbol: str) -> float:
-    """Fetches price from Binance for Crypto, Yahoo Finance for Forex."""
+
+def get_current_price(symbol: str) -> float | None:
+    """Live price from Binance (crypto) or Yahoo Finance (forex). None if unavailable."""
     try:
-        # If it's crypto (e.g., BTCUSDT), use Binance
         if "USDT" in symbol.upper() or "BTC" in symbol.upper():
             url = f"https://api.binance.com/api/v3/ticker/price?symbol={symbol.upper()}"
             response = httpx.get(url, timeout=10)
             response.raise_for_status()
             return float(response.json()["price"])
-        
-        # If it's Forex (e.g., EURUSD), use Yahoo Finance (needs '=X' suffix)
-        else:
-            ticker = f"{symbol.upper()}=X"
-            data = yf.Ticker(ticker)
-            # Get the most recent 1-minute data
-            hist = data.history(period="1d", interval="1m")
-            if hist.empty:
-                return None
-            return float(hist['Close'].iloc[-1])
-            
+        hist = yf.Ticker(f"{symbol.upper()}=X").history(period="1d", interval="1m")
+        if hist.empty:
+            return None
+        return float(hist["Close"].iloc[-1])
     except Exception as e:
         print(f"Failed to fetch price for {symbol}: {e}")
         return None
 
+
+def evaluate(direction: str, entry: float, stop: float, target: float, price: float):
+    """Return (status, pnl_percent). Status is 'pending' if neither level was hit."""
+    if direction == "long":
+        if price >= target:
+            return "target_hit", round((target - entry) / entry * 100, 2)
+        if price <= stop:
+            return "stop_hit", round((stop - entry) / entry * 100, 2)
+    elif direction == "short":
+        if price <= target:
+            return "target_hit", round((entry - target) / entry * 100, 2)
+        if price >= stop:
+            return "stop_hit", round((entry - stop) / entry * 100, 2)
+    return "pending", None
+
+
 def track_outcomes():
     db = SessionLocal()
-    pending_signals = db.query(Signal).filter(Signal.status == "pending").all()
-    
-    if not pending_signals:
-        print("No pending signals to track.")
+    try:
+        pending = (
+            db.query(Signal)
+            .filter(Signal.status == "pending", Signal.signal_type == "entry")
+            .all()
+        )
+        if not pending:
+            print("No pending entry signals to track.")
+            return
+
+        print(f"Tracking {len(pending)} pending signals...\n" + "-" * 50)
+        for signal in pending:
+            if None in (signal.entry, signal.stop, signal.target) or signal.entry == 0:
+                print(f"[{signal.signal_id}] skipped: missing entry/stop/target")
+                continue
+
+            price = get_current_price(signal.symbol)
+            if price is None:
+                print(f"[{signal.symbol}] skipped: no price available")
+                continue
+
+            status, pnl = evaluate(
+                signal.direction, signal.entry, signal.stop, signal.target, price
+            )
+            print(f"[{signal.symbol}] {signal.direction.upper()} | price {price:.5f} -> {status}")
+            if status != "pending":
+                signal.status = status
+                signal.pnl = pnl
+
+        db.commit()
+        print("Database updated.")
+    finally:
         db.close()
-        return
 
-    print(f"Tracking {len(pending_signals)} pending signals...\n" + "-"*50)
-
-    for signal in pending_signals:
-        current_price = get_current_price(signal.symbol)
-        
-        if not current_price:
-            continue
-            
-        print(f"[{signal.symbol}] {signal.direction.upper()} | Entry: {signal.entry:.5f} | Target: {signal.target:.5f} | Stop: {signal.stop:.5f}")
-        print(f"Current Live Price: {current_price:.5f}")
-
-        if signal.direction == "long":
-            if current_price >= signal.target:
-                signal.status = "target_hit"
-                signal.pnl = round(((signal.target - signal.entry) / signal.entry) * 100, 2)
-                print(f"🎯 TARGET HIT! PnL: +{signal.pnl}%")
-            elif current_price <= signal.stop:
-                signal.status = "stop_hit"
-                signal.pnl = round(((signal.stop - signal.entry) / signal.entry) * 100, 2)
-                print(f"🛑 STOP HIT! PnL: {signal.pnl}%")
-            else:
-                print("⏳ Still pending (Price is between Stop and Target)")
-
-        elif signal.direction == "short":
-            if current_price <= signal.target:
-                signal.status = "target_hit"
-                signal.pnl = round(((signal.entry - signal.target) / signal.entry) * 100, 2)
-                print(f"🎯 TARGET HIT! PnL: +{signal.pnl}%")
-            elif current_price >= signal.stop:
-                signal.status = "stop_hit"
-                signal.pnl = round(((signal.entry - signal.stop) / signal.entry) * 100, 2)
-                print(f"🛑 STOP HIT! PnL: {signal.pnl}%")
-            else:
-                print("⏳ Still pending (Price is between Stop and Target)")
-
-        print("-" * 50)
-    
-    db.commit()
-    db.close()
-    print("Database updated.")
 
 if __name__ == "__main__":
     track_outcomes()
